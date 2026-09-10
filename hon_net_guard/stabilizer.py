@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -41,14 +42,46 @@ class HonNetGuard:
         self.status = GuardStatus(admin=qos.is_admin(), max_ping_mode=self.settings.max_ping_mode)
         self.monitor = NetMonitor(self.settings)
         self._auto_reapply = True
+        self._busy = False
+        self._shutdown = threading.Event()
 
     def start_monitor(self) -> None:
+        if self._shutdown.is_set():
+            return
         self.monitor.start()
 
     def stop_monitor(self) -> None:
-        self.monitor.stop()
+        self.monitor.clear_callbacks()
+        self.monitor.stop(join_timeout=0.8)
+
+    def shutdown(self, remove_qos: bool = True) -> None:
+        """Fast, idempotent teardown used on window close / Ctrl+C."""
+        if self._shutdown.is_set():
+            return
+        self._shutdown.set()
+        self._auto_reapply = False
+        self.stop_monitor()
+        if remove_qos and self.status.active:
+            try:
+                qos.remove_throttle()
+            except Exception:
+                pass
+            self.status.active = False
+            self.status.qos_applied = False
 
     def activate(self, max_ping: bool | None = None) -> bool:
+        if self._shutdown.is_set():
+            return False
+        if self._busy:
+            self.status.log("Already activating — please wait.")
+            return False
+        self._busy = True
+        try:
+            return self._activate_inner(max_ping)
+        finally:
+            self._busy = False
+
+    def _activate_inner(self, max_ping: bool | None) -> bool:
         self.status.admin = qos.is_admin()
         if max_ping is True:
             self.settings.apply_max_ping_profile()
@@ -70,7 +103,11 @@ class HonNetGuard:
             return False
 
         self.status.log("Measuring ping before activation...")
-        self.status.baseline = ping_boost.measure_ping(self.settings.ping_host, count=5)
+        self.status.baseline = ping_boost.measure_ping(
+            self.settings.ping_host, count=3, stop_event=self._shutdown
+        )
+        if self._shutdown.is_set():
+            return False
         b = self.status.baseline
         if b.avg is not None:
             jitter = f"{b.jitter:.0f}" if b.jitter is not None else "?"
@@ -98,7 +135,7 @@ class HonNetGuard:
         if result.stdout:
             self.status.log(result.stdout)
 
-        if self.settings.max_ping_mode:
+        if self.settings.max_ping_mode and not self._shutdown.is_set():
             if qos.is_linux():
                 tw = ping_boost.apply_linux_latency_tweaks()
                 if tw.ok:
@@ -121,8 +158,13 @@ class HonNetGuard:
         if flush.ok and flush.stdout != "skip":
             self.status.log("DNS cache flushed.")
 
+        if self._shutdown.is_set():
+            return True
+
         self.status.log("Measuring ping after activation...")
-        self.status.after = ping_boost.measure_ping(self.settings.ping_host, count=6)
+        self.status.after = ping_boost.measure_ping(
+            self.settings.ping_host, count=4, stop_event=self._shutdown
+        )
         a = self.status.after
         if a.avg is not None:
             jitter = f"{a.jitter:.0f}" if a.jitter is not None else "?"
@@ -189,8 +231,16 @@ class HonNetGuard:
         return self.status.live_score
 
     def reapply_if_needed(self, snap: Snapshot) -> None:
-        if not self.status.active or not self._auto_reapply:
+        if self._shutdown.is_set() or not self.status.active or not self._auto_reapply:
+            return
+        if self._busy:
             return
         if snap.saturating and snap.game_found and not qos.throttle_active():
-            self.status.log("Guard policy missing — re-applying...")
-            self.activate()
+            self.status.log("Guard policy missing — re-applying cap only...")
+            # Lightweight re-apply: no ping measurement round-trip.
+            result = qos.apply_throttle(self.settings)
+            if result.ok:
+                self.status.qos_applied = True
+                self.status.log("Cap re-applied.")
+            else:
+                self.status.log(f"Re-apply failed: {result.stderr or result.stdout}")

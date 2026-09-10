@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import statistics
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 
 from . import qos
-from .monitor import _ping_once
+from .monitor import ping_once
 from .qos import CommandResult
 
 
@@ -44,16 +45,27 @@ class PingSample:
         return max(self.values_ms) if self.values_ms else None
 
 
-def measure_ping(host: str, count: int = 6, gap: float = 0.25) -> PingSample:
+def measure_ping(
+    host: str,
+    count: int = 4,
+    gap: float = 0.12,
+    stop_event: threading.Event | None = None,
+) -> PingSample:
     sample = PingSample()
     for _ in range(count):
-        ok, ms = _ping_once(host, timeout_sec=1.5)
+        if stop_event is not None and stop_event.is_set():
+            break
+        ok, ms = ping_once(host, timeout_sec=0.8, stop_event=stop_event)
         if ok and ms is not None:
             sample.ok_count += 1
             sample.values_ms.append(ms)
         else:
             sample.fail_count += 1
-        time.sleep(gap)
+        if stop_event is not None:
+            if stop_event.wait(gap):
+                break
+        else:
+            time.sleep(gap)
     return sample
 
 

@@ -1,68 +1,424 @@
-"""English Tkinter UI for HoN Net Guard (Windows + Linux)."""
+"""Dashboard UI for HoN Net Guard (Windows + Linux).
+
+Drawn mostly with tk.Canvas / tk.Frame so Fedora GTK themes cannot hide
+button labels the way ttk widgets do.
+"""
 
 from __future__ import annotations
 
+import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 from .config import MAX_PING_SHARE, Settings
+from .hogs import format_activity, kill_high_risk, kill_process
+from .hon_tracker import format_duration
 from .monitor import Snapshot, format_rate
 from .stabilizer import HonNetGuard
 from . import qos
 
-# High-contrast palette (works on Fedora/Windows dark & light desktops)
-BG = "#12161c"
-CARD = "#1e2630"
-CARD2 = "#263140"
-TEXT = "#f2f5f8"
-MUTED = "#a7b3c2"
-ACCENT = "#f0c14b"
-GREEN = "#2fd67b"
-BTN_BG = "#3a4a5c"
-BTN_BG_HOVER = "#4b5f75"
-BTN_FG = "#ffffff"
-ACCENT_BTN_BG = "#c9941a"
-ACCENT_BTN_HOVER = "#e0a820"
-ACCENT_BTN_FG = "#141414"
-DANGER_BG = "#8b3a3a"
-ENTRY_BG = "#0f1318"
-WARN = "#ff8f6b"
+# ---------------------------------------------------------------------------
+# Palette — high contrast, gaming-utility look
+# ---------------------------------------------------------------------------
+BG = "#0b0f16"
+BG2 = "#10161f"
+CARD = "#161e2a"
+CARD_HI = "#1c2634"
+EDGE = "#2c3a4e"
+TEXT = "#f3f6fa"
+MUTED = "#8d9cb0"
+GOLD = "#e8b84a"
+GOLD_DK = "#c49222"
+GOLD_FG = "#16120a"
+GREEN = "#3ee08a"
+GREEN_DK = "#1f8a52"
+RED = "#e45d5d"
+RED_DK = "#9b2e2e"
+ORANGE = "#ff9a62"
+CYAN = "#5ec8ff"
+ENTRY = "#0c1118"
+TRACK = "#0c1118"
+
+
+def _round_fill(canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float, r: float, fill: str) -> list[int]:
+    """Crisp rounded rectangle (4 discs + 2 bars). Returns item ids."""
+    r = max(0.0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+    ids = [
+        canvas.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline=""),
+        canvas.create_rectangle(x1, y1 + r, x2, y2 - r, fill=fill, outline=""),
+        canvas.create_oval(x1, y1, x1 + 2 * r, y1 + 2 * r, fill=fill, outline=""),
+        canvas.create_oval(x2 - 2 * r, y1, x2, y1 + 2 * r, fill=fill, outline=""),
+        canvas.create_oval(x1, y2 - 2 * r, x1 + 2 * r, y2, fill=fill, outline=""),
+        canvas.create_oval(x2 - 2 * r, y2 - 2 * r, x2, y2, fill=fill, outline=""),
+    ]
+    return ids
+
+
+class PillButton(tk.Canvas):
+    """Self-painted button — text is always drawn, never theme-dependent."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        text: str,
+        command,
+        *,
+        font: tuple,
+        variant: str = "default",
+        width: int = 148,
+        height: int = 40,
+    ) -> None:
+        super().__init__(
+            parent,
+            width=width,
+            height=height,
+            bg=parent.cget("bg") if str(parent.cget("bg")) else BG,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        self._text = text
+        self._command = command
+        self._font = font
+        self._variant = variant
+        self._bw = width
+        self._bh = height
+        self._hover = False
+        self._down = False
+        self._enabled = True
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Configure>", lambda _e: self._draw())
+        self._draw()
+
+    def set_text(self, text: str) -> None:
+        self._text = text
+        self._draw()
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._enabled = enabled
+        self.configure(cursor="hand2" if enabled else "arrow")
+        self._draw()
+
+    def _colors(self) -> tuple[str, str]:
+        if not self._enabled:
+            return "#2a3340", "#7a8796"
+        press = self._down
+        hover = self._hover
+        if self._variant == "primary":
+            bg = "#f0c45a" if hover or press else GOLD
+            return (GOLD_DK if press else bg), GOLD_FG
+        if self._variant == "danger":
+            bg = "#f06a6a" if hover or press else RED
+            return (RED_DK if press else bg), TEXT
+        if self._variant == "ghost":
+            bg = "#243044" if hover or press else CARD_HI
+            return bg, TEXT
+        bg = "#2b3a4d" if hover or press else "#223044"
+        return bg, TEXT
+
+    def _draw(self) -> None:
+        self.delete("all")
+        w = max(self._bw, int(self.winfo_width() or self._bw))
+        h = max(self._bh, int(self.winfo_height() or self._bh))
+        bg, fg = self._colors()
+        _round_fill(self, 1, 1, w - 2, h - 2, 10, bg)
+        self.create_text(w / 2, h / 2, text=self._text, fill=fg, font=self._font)
+
+    def _on_enter(self, _e) -> None:
+        self._hover = True
+        self._draw()
+
+    def _on_leave(self, _e) -> None:
+        self._hover = False
+        self._down = False
+        self._draw()
+
+    def _on_press(self, _e) -> None:
+        if not self._enabled:
+            return
+        self._down = True
+        self._draw()
+
+    def _on_release(self, _e) -> None:
+        if not self._enabled:
+            return
+        was = self._down
+        self._down = False
+        self._draw()
+        if was and self._command:
+            self._command()
+
+
+class TabChip(tk.Canvas):
+    def __init__(self, parent: tk.Misc, text: str, command, font: tuple, width: int = 170) -> None:
+        super().__init__(
+            parent, width=width, height=34, bg=BG, highlightthickness=0, bd=0, cursor="hand2"
+        )
+        self._text = text
+        self._command = command
+        self._font = font
+        self._active = False
+        self._hover = False
+        self.bind("<Enter>", lambda _e: self._set_hover(True))
+        self.bind("<Leave>", lambda _e: self._set_hover(False))
+        self.bind("<Button-1>", lambda _e: self._command and self._command())
+        self._draw()
+
+    def set_active(self, active: bool) -> None:
+        self._active = active
+        self._draw()
+
+    def _set_hover(self, hover: bool) -> None:
+        self._hover = hover
+        self._draw()
+
+    def _draw(self) -> None:
+        self.delete("all")
+        w, h = int(self.cget("width")), int(self.cget("height"))
+        if self._active:
+            fill, fg = GOLD, GOLD_FG
+        elif self._hover:
+            fill, fg = "#243044", TEXT
+        else:
+            fill, fg = CARD, MUTED
+        _round_fill(self, 1, 1, w - 2, h - 2, 8, fill)
+        self.create_text(w / 2, h / 2, text=self._text, fill=fg, font=self._font)
+
+
+class Chip(tk.Frame):
+    def __init__(self, parent: tk.Misc, font: tuple) -> None:
+        super().__init__(
+            parent, bg=CARD, padx=10, pady=5, highlightbackground=EDGE, highlightthickness=1
+        )
+        self._dot = tk.Canvas(self, width=8, height=8, bg=CARD, highlightthickness=0, bd=0)
+        self._dot.pack(side="left", padx=(0, 6))
+        self._var = tk.StringVar(value="")
+        self._lbl = tk.Label(self, textvariable=self._var, bg=CARD, fg=MUTED, font=font)
+        self._lbl.pack(side="left")
+        self._tone = "muted"
+
+    def set(self, text: str, tone: str = "muted") -> None:
+        self._var.set(text)
+        colors = {
+            "ok": GREEN,
+            "warn": ORANGE,
+            "bad": RED,
+            "gold": GOLD,
+            "info": CYAN,
+            "muted": MUTED,
+        }
+        c = colors.get(tone, MUTED)
+        self._dot.delete("all")
+        self._dot.create_oval(1, 1, 7, 7, fill=c, outline="")
+        self._lbl.configure(fg=c if tone in ("ok", "warn", "bad", "gold") else MUTED)
+        self._tone = tone
+
+
+class MetricTile(tk.Frame):
+    def __init__(self, parent: tk.Misc, caption: str, fonts: dict[str, tuple]) -> None:
+        super().__init__(parent, bg=CARD_HI, highlightbackground=EDGE, highlightthickness=1)
+        pad = tk.Frame(self, bg=CARD_HI)
+        pad.pack(fill="both", expand=True, padx=12, pady=10)
+        tk.Label(pad, text=caption.upper(), bg=CARD_HI, fg=MUTED, font=fonts["tiny"]).pack(anchor="w")
+        self.value = tk.StringVar(value="—")
+        self._val = tk.Label(
+            pad, textvariable=self.value, bg=CARD_HI, fg=TEXT, font=fonts["metric"]
+        )
+        self._val.pack(anchor="w", pady=(2, 0))
+        self.hint = tk.StringVar(value="")
+        self._hint = tk.Label(
+            pad, textvariable=self.hint, bg=CARD_HI, fg=MUTED, font=fonts["tiny"]
+        )
+        self._hint.pack(anchor="w")
+
+    def set(self, value: str, hint: str = "", tone: str = "normal") -> None:
+        self.value.set(value)
+        self.hint.set(hint)
+        fg = {"good": GREEN, "warn": ORANGE, "bad": RED, "gold": GOLD}.get(tone, TEXT)
+        self._val.configure(fg=fg)
+
+
+class ScoreRing(tk.Canvas):
+    def __init__(self, parent: tk.Misc, fonts: dict[str, tuple], size: int = 168) -> None:
+        super().__init__(
+            parent, width=size, height=size, bg=CARD, highlightthickness=0, bd=0
+        )
+        self._fonts = fonts
+        self._size = size
+        self._value = 0.0
+        self._subtitle = "Inactive"
+        self._draw()
+
+    def set(self, value: float, subtitle: str) -> None:
+        self._value = max(0.0, min(100.0, value))
+        self._subtitle = subtitle
+        self._draw()
+
+    def _draw(self) -> None:
+        self.delete("all")
+        s = self._size
+        pad = 16
+        cx = cy = s / 2
+        width = 12
+        track = "#0e1620"
+        pct = self._value / 100.0
+        if pct >= 0.99:
+            arc = GREEN
+        elif pct >= 0.7:
+            arc = GOLD
+        elif pct > 0:
+            arc = CYAN
+        else:
+            arc = EDGE
+
+        self.create_oval(pad, pad, s - pad, s - pad, outline=track, width=width)
+        if pct > 0.002:
+            # Tk arcs: 90° = 12 o'clock, negative extent = clockwise
+            extent = max(-359.9, -pct * 359.9)
+            self.create_arc(
+                pad,
+                pad,
+                s - pad,
+                s - pad,
+                start=90,
+                extent=extent,
+                style="arc",
+                outline=arc,
+                width=width,
+            )
+        self.create_text(cx, cy - 8, text=f"{self._value:.0f}%", fill=TEXT, font=self._fonts["score"])
+        self.create_text(cx, cy + 22, text=self._subtitle, fill=MUTED, font=self._fonts["tiny"])
+
+
+class CapSlider(tk.Canvas):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        variable: tk.DoubleVar,
+        *,
+        from_: float = 25,
+        to: float = 85,
+        command=None,
+    ) -> None:
+        super().__init__(parent, height=28, bg=CARD, highlightthickness=0, bd=0, cursor="hand2")
+        self.var = variable
+        self.from_ = from_
+        self.to = to
+        self.command = command
+        self._knob_r = 8
+        self.bind("<Button-1>", self._drag)
+        self.bind("<B1-Motion>", self._drag)
+        self.bind("<Configure>", lambda _e: self._draw())
+        variable.trace_add("write", lambda *_: self._draw())
+        self._draw()
+
+    def _frac(self) -> float:
+        try:
+            v = float(self.var.get())
+        except (tk.TclError, ValueError, TypeError):
+            v = self.from_
+        span = self.to - self.from_
+        if span <= 0:
+            return 0.0
+        return max(0.0, min(1.0, (v - self.from_) / span))
+
+    def _draw(self) -> None:
+        self.delete("all")
+        w = int(self.winfo_width() or 200)
+        h = int(self.winfo_height() or 28)
+        y = h / 2
+        x0, x1 = 10, w - 10
+        self.create_line(x0, y, x1, y, fill=TRACK, width=6, capstyle="round")
+        xf = x0 + (x1 - x0) * self._frac()
+        self.create_line(x0, y, xf, y, fill=GOLD, width=6, capstyle="round")
+        r = self._knob_r
+        self.create_oval(xf - r, y - r, xf + r, y + r, fill=TEXT, outline=GOLD, width=2)
+
+    def _drag(self, event) -> None:
+        w = int(self.winfo_width() or 200)
+        x0, x1 = 10, w - 10
+        frac = 0.0 if x1 <= x0 else max(0.0, min(1.0, (event.x - x0) / (x1 - x0)))
+        value = self.from_ + frac * (self.to - self.from_)
+        self.var.set(value)
+        if self.command:
+            self.command(str(value))
 
 
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title(f"HoN Net Guard — {qos.platform_name()}")
-        self.geometry("780x700")
-        self.minsize(700, 620)
+        self.title(f"ZYTONA APP — HoN Net Guard — {qos.platform_name()}")
+        self.geometry("960x720")
+        self.minsize(880, 640)
         self.configure(bg=BG)
         try:
-            self.tk.call("tk", "scaling", 1.15)
+            self.tk.call("tk", "scaling", 1.1)
         except tk.TclError:
             pass
 
         self.guard = HonNetGuard()
+        self._closing = False
+        self._status_job: str | None = None
+        self._score_shown = 0.0
+        self._score_target = 0.0
+        self._score_job: str | None = None
+        self._page = "guard"
+        self._hog_rows: dict[str, int] = {}
+        self._last_hog_warn = ""
+        self._busy = False
+
+        self._pick_fonts()
         self._build_style()
         self._build_ui()
         self.guard.monitor.on_update(self._on_snapshot)
         self.guard.start_monitor()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(400, self._refresh_status_bar)
+        self.bind("<Control-q>", lambda _e: self._on_close())
+        self.bind("<Control-Q>", lambda _e: self._on_close())
+        self._status_job = self.after(400, self._refresh_status_bar)
+
+    def _pick_fonts(self) -> None:
+        if qos.is_windows():
+            ui, mono = "Segoe UI", "Consolas"
+        else:
+            families = set()
+            try:
+                families = {str(f) for f in self.tk.call("font", "families")}
+            except tk.TclError:
+                pass
+            ui = next(
+                (n for n in ("Noto Sans", "DejaVu Sans", "Cantarell", "Sans") if n in families),
+                "Sans",
+            )
+            mono = next(
+                (n for n in ("JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono") if n in families),
+                "Monospace",
+            )
+        self._ff = ui
+        self._fm = mono
+        self.fonts = {
+            "title": (ui, 18, "bold"),
+            "sub": (ui, 9),
+            "section": (ui, 9, "bold"),
+            "body": (ui, 10),
+            "body_b": (ui, 10, "bold"),
+            "btn": (ui, 10, "bold"),
+            "tiny": (ui, 9),
+            "metric": (ui, 15, "bold"),
+            "score": (ui, 26, "bold"),
+            "mono": (mono, 9),
+            "stat": (mono, 10),
+        }
 
     def _font(self, size: int = 10, bold: bool = False) -> tuple:
-        if qos.is_windows():
-            family = "Segoe UI"
-        else:
-            # Prefer fonts that render well on Fedora
-            for candidate in ("Noto Sans", "DejaVu Sans", "Cantarell", "Sans"):
-                family = candidate
-                break
-        return (family, size, "bold") if bold else (family, size)
+        return (self._ff, size, "bold") if bold else (self._ff, size)
 
     def _mono(self, size: int = 10) -> tuple:
-        if qos.is_windows():
-            return ("Consolas", size)
-        return ("DejaVu Sans Mono", size)
+        return (self._fm, size)
 
     def _build_style(self) -> None:
         style = ttk.Style(self)
@@ -70,315 +426,506 @@ class App(tk.Tk):
             style.theme_use("clam")
         except tk.TclError:
             pass
-
-        style.configure(".", background=BG, foreground=TEXT, font=self._font(10))
+        style.configure(".", background=BG, foreground=TEXT, font=self.fonts["body"])
         style.configure("TFrame", background=BG)
-        style.configure("Card.TFrame", background=CARD)
-        style.configure("Card2.TFrame", background=CARD2)
-
-        style.configure("TLabel", background=BG, foreground=TEXT, font=self._font(10))
-        style.configure("Card.TLabel", background=CARD, foreground=TEXT, font=self._font(10))
         style.configure(
-            "Title.TLabel",
-            background=BG,
-            foreground=ACCENT,
-            font=self._font(18, True),
-        )
-        style.configure(
-            "Score.TLabel",
-            background=CARD,
-            foreground=GREEN,
-            font=self._font(24, True),
-        )
-        style.configure(
-            "Stat.TLabel",
-            background=CARD,
+            "Treeview",
+            background=ENTRY,
             foreground=TEXT,
-            font=self._mono(11),
+            fieldbackground=ENTRY,
+            rowheight=28,
+            font=self.fonts["body"],
+            borderwidth=0,
         )
         style.configure(
-            "Muted.TLabel",
-            background=BG,
-            foreground=MUTED,
-            font=self._font(9),
-        )
-        style.configure(
-            "CardMuted.TLabel",
-            background=CARD,
-            foreground=MUTED,
-            font=self._font(9),
-        )
-        style.configure(
-            "Warn.TLabel",
-            background=CARD,
-            foreground=WARN,
-            font=self._font(10, True),
-        )
-        style.configure(
-            "Section.TLabel",
-            background=CARD,
-            foreground=ACCENT,
-            font=self._font(11, True),
-        )
-
-        style.configure(
-            "TCheckbutton",
-            background=CARD,
-            foreground=TEXT,
-            font=self._font(10),
-            focuscolor=CARD,
+            "Treeview.Heading",
+            background=CARD_HI,
+            foreground=GOLD,
+            font=self.fonts["body_b"],
+            relief="flat",
         )
         style.map(
-            "TCheckbutton",
-            background=[("active", CARD), ("selected", CARD)],
-            foreground=[("active", TEXT), ("selected", TEXT), ("disabled", MUTED)],
+            "Treeview",
+            background=[("selected", "#2b3d55")],
+            foreground=[("selected", TEXT)],
         )
-
         style.configure(
-            "TEntry",
-            fieldbackground=ENTRY_BG,
-            foreground=TEXT,
-            insertcolor=TEXT,
-            bordercolor="#445466",
-            lightcolor="#445466",
-            darkcolor="#445466",
-            padding=6,
-        )
-        style.map(
-            "TEntry",
-            fieldbackground=[("focus", ENTRY_BG), ("!disabled", ENTRY_BG)],
-            foreground=[("!disabled", TEXT)],
-        )
-
-        style.configure(
-            "Horizontal.TScale",
-            background=CARD,
-            troughcolor=ENTRY_BG,
+            "Vertical.TScrollbar",
+            background=CARD_HI,
+            troughcolor=ENTRY,
             bordercolor=CARD,
-            lightcolor=GREEN,
-            darkcolor=GREEN,
+            arrowcolor=MUTED,
         )
 
-        style.configure(
-            "Green.Horizontal.TProgressbar",
-            troughcolor=ENTRY_BG,
-            background=GREEN,
-            bordercolor=CARD,
-            lightcolor=GREEN,
-            darkcolor=GREEN,
-            thickness=16,
-        )
+    def _card(self, parent: tk.Misc, **pack) -> tk.Frame:
+        wrap = tk.Frame(parent, bg=CARD, highlightbackground=EDGE, highlightthickness=1)
+        if pack:
+            wrap.pack(**pack)
+        return wrap
 
-    def _make_button(
-        self,
-        parent: tk.Misc,
-        text: str,
-        command,
-        *,
-        primary: bool = False,
-        danger: bool = False,
-    ) -> tk.Button:
-        if primary:
-            bg, hover, fg = ACCENT_BTN_BG, ACCENT_BTN_HOVER, ACCENT_BTN_FG
-        elif danger:
-            bg, hover, fg = DANGER_BG, "#a44848", BTN_FG
-        else:
-            bg, hover, fg = BTN_BG, BTN_BG_HOVER, BTN_FG
-
-        # Use classic raised buttons — flat ttk/tk buttons often vanish on Fedora themes.
-        btn = tk.Button(
-            parent,
-            text=text,
-            command=command,
-            font=self._font(11, bold=True),
-            bg=bg,
-            fg=fg,
-            activebackground=hover,
-            activeforeground=fg,
-            disabledforeground="#8899aa",
-            relief="raised",
-            bd=3,
-            padx=16,
-            pady=10,
-            cursor="hand2",
-            highlightthickness=1,
-            highlightbackground="#ffffff",
-            highlightcolor="#ffffff",
-        )
-        btn.bind("<Enter>", lambda _e, b=btn, h=hover: b.configure(bg=h, relief="raised"))
-        btn.bind("<Leave>", lambda _e, b=btn, c=bg: b.configure(bg=c, relief="raised"))
-        return btn
-    def _priv_text(self) -> str:
+    def _priv_text(self) -> tuple[str, str]:
         if qos.is_admin():
-            return "Privileges: root/Admin OK" if qos.is_linux() else "Privileges: Administrator OK"
+            return ("Root OK" if qos.is_linux() else "Admin OK", "ok")
         if qos.is_linux():
-            return "Privileges: normal — run with: sudo ./run_linux.sh"
-        return "Privileges: normal — Run as Administrator required"
+            return ("Need sudo", "warn")
+        return ("Run as Admin", "warn")
 
     def _build_ui(self) -> None:
-        # 1) Pin action bar to the BOTTOM first — otherwise tall content pushes buttons off-screen.
-        action_bar = tk.Frame(self, bg="#0a0d12", padx=12, pady=12)
-        action_bar.pack(side="bottom", fill="x")
+        # Dock first so it never gets pushed off-screen.
+        dock = tk.Frame(self, bg=BG2, padx=18, pady=12)
+        dock.pack(side="bottom", fill="x")
+        tk.Frame(dock, bg=EDGE, height=1).pack(fill="x", pady=(0, 10))
+        row = tk.Frame(dock, bg=BG2)
+        row.pack(fill="x")
+        self.btn_max = PillButton(
+            row, "Max Ping 100%", self._activate_max, font=self.fonts["btn"], variant="primary", width=168
+        )
+        self.btn_max.pack(side="left", padx=(0, 8))
+        self.btn_on = PillButton(
+            row, "Enable", self._activate, font=self.fonts["btn"], width=110
+        )
+        self.btn_on.pack(side="left", padx=(0, 8))
+        self.btn_kill = PillButton(
+            row, "Kill Risky", self._kill_risky, font=self.fonts["btn"], variant="danger", width=120
+        )
+        self.btn_kill.pack(side="left", padx=(0, 8))
+        self.btn_stop = PillButton(
+            row, "Stop", self._deactivate, font=self.fonts["btn"], variant="danger", width=96
+        )
+        self.btn_stop.pack(side="left", padx=(0, 8))
+        self.btn_save = PillButton(
+            row, "Save", self._save_settings, font=self.fonts["btn"], variant="ghost", width=96
+        )
+        self.btn_save.pack(side="left")
+        self.dock_hint = tk.StringVar(value="Ready")
         tk.Label(
-            action_bar,
-            text="ACTIONS",
-            bg="#0a0d12",
-            fg=ACCENT,
-            font=self._font(10, True),
-        ).pack(anchor="w", pady=(0, 8))
-        btns = tk.Frame(action_bar, bg="#0a0d12")
-        btns.pack(fill="x")
-        self._make_button(
-            btns, "Enable Max Ping 100%", self._activate_max, primary=True
-        ).pack(side="left", padx=(0, 8))
-        self._make_button(btns, "Enable Normal", self._activate).pack(side="left", padx=(0, 8))
-        self._make_button(btns, "Stop", self._deactivate, danger=True).pack(side="left", padx=(0, 8))
-        self._make_button(btns, "Save", self._save_settings).pack(side="left")
-
-        # 2) Main content fills remaining space above the action bar.
-        outer = ttk.Frame(self, style="TFrame")
-        outer.pack(side="top", fill="both", expand=True, padx=16, pady=(14, 8))
+            row, textvariable=self.dock_hint, bg=BG2, fg=MUTED, font=self.fonts["tiny"]
+        ).pack(side="right")
 
         # Header
-        ttk.Label(outer, text="HoN Net Guard", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(
-            outer,
-            text="Stabilize ping and stop timeouts while playing Heroes of Newerth Reborn",
-            style="Muted.TLabel",
-            wraplength=720,
-            justify="left",
-        ).pack(anchor="w", pady=(2, 6))
-        self.admin_var = tk.StringVar(value=self._priv_text())
-        ttk.Label(outer, textvariable=self.admin_var, style="Muted.TLabel").pack(anchor="w")
-
-        # Score
-        score_card = ttk.Frame(outer, style="Card.TFrame")
-        score_card.pack(fill="x", pady=(12, 8))
-        s_in = ttk.Frame(score_card, style="Card.TFrame")
-        s_in.pack(fill="x", padx=14, pady=14)
-        ttk.Label(s_in, text="PING SCORE", style="Section.TLabel").pack(anchor="w")
-        self.score_var = tk.StringVar(value="Ping improvement: 0%")
-        ttk.Label(s_in, textvariable=self.score_var, style="Score.TLabel").pack(
-            anchor="w", pady=(4, 0)
+        header = tk.Frame(self, bg=BG, padx=20, pady=14)
+        header.pack(side="top", fill="x")
+        brand = tk.Frame(header, bg=BG)
+        brand.pack(side="left")
+        mark = tk.Canvas(brand, width=36, height=36, bg=BG, highlightthickness=0, bd=0)
+        mark.pack(side="left", padx=(0, 10))
+        _round_fill(mark, 2, 2, 34, 34, 8, GOLD)
+        mark.create_text(18, 18, text="Z", fill=GOLD_FG, font=(self._ff, 14, "bold"))
+        names = tk.Frame(brand, bg=BG)
+        names.pack(side="left")
+        tk.Label(names, text="ZYTONA APP", bg=BG, fg=TEXT, font=self.fonts["title"]).pack(
+            anchor="w"
         )
-        self.score_bar = ttk.Progressbar(
+        tk.Label(
+            names, text="HoN Net Guard  ·  stabilize ping, stop timeouts", bg=BG, fg=MUTED, font=self.fonts["sub"]
+        ).pack(anchor="w")
+
+        chips = tk.Frame(header, bg=BG)
+        chips.pack(side="right")
+        self.chip_os = Chip(chips, self.fonts["tiny"])
+        self.chip_os.pack(side="left", padx=4)
+        self.chip_os.set(qos.platform_name(), "info")
+        self.chip_priv = Chip(chips, self.fonts["tiny"])
+        self.chip_priv.pack(side="left", padx=4)
+        t, tone = self._priv_text()
+        self.chip_priv.set(t, tone)
+        self.chip_mode = Chip(chips, self.fonts["tiny"])
+        self.chip_mode.pack(side="left", padx=4)
+        self.chip_mode.set("Idle", "muted")
+
+        # Tabs
+        tabs = tk.Frame(self, bg=BG, padx=20)
+        tabs.pack(side="top", fill="x", pady=(0, 8))
+        self.tab_guard = TabChip(
+            tabs, "Guard", lambda: self._show_page("guard"), self.fonts["body_b"], width=108
+        )
+        self.tab_guard.pack(side="left", padx=(0, 8))
+        self.tab_live = TabChip(
+            tabs, "HoN Live", lambda: self._show_page("live"), self.fonts["body_b"], width=120
+        )
+        self.tab_live.pack(side="left", padx=(0, 8))
+        self.tab_hogs = TabChip(
+            tabs, "Network Task Manager", lambda: self._show_page("hogs"), self.fonts["body_b"], width=210
+        )
+        self.tab_hogs.pack(side="left")
+
+        body = tk.Frame(self, bg=BG)
+        body.pack(side="top", fill="both", expand=True, padx=20, pady=(0, 8))
+        self._body = body
+
+        self._page_guard = tk.Frame(body, bg=BG)
+        self._page_live = tk.Frame(body, bg=BG)
+        self._page_hogs = tk.Frame(body, bg=BG)
+        self._build_guard(self._page_guard)
+        self._build_live(self._page_live)
+        self._build_hogs(self._page_hogs)
+        self._show_page("guard")
+
+        self._append_log("HoN Live tracks the game moment-by-moment when it opens.")
+        if not qos.is_admin():
+            self._append_log("Warning: without root/Admin the bandwidth cap cannot be applied.")
+
+    def _show_page(self, name: str) -> None:
+        self._page = name
+        self._page_guard.pack_forget()
+        self._page_live.pack_forget()
+        self._page_hogs.pack_forget()
+        pages = {
+            "guard": self._page_guard,
+            "live": self._page_live,
+            "hogs": self._page_hogs,
+        }
+        pages.get(name, self._page_guard).pack(fill="both", expand=True)
+        self.tab_guard.set_active(name == "guard")
+        self.tab_live.set_active(name == "live")
+        self.tab_hogs.set_active(name == "hogs")
+
+    def _build_guard(self, tab: tk.Frame) -> None:
+        top = tk.Frame(tab, bg=BG)
+        top.pack(fill="x")
+
+        score_wrap = self._card(top)
+        score_wrap.pack(side="left", fill="y", padx=(0, 10))
+        s_in = tk.Frame(score_wrap, bg=CARD)
+        s_in.pack(fill="both", expand=True, padx=16, pady=14)
+        tk.Label(s_in, text="PING SCORE", bg=CARD, fg=GOLD, font=self.fonts["section"]).pack(
+            anchor="w"
+        )
+        self.ring = ScoreRing(s_in, self.fonts)
+        self.ring.pack(pady=(6, 4))
+        self.score_detail = tk.StringVar(value="Enable Max Ping to stabilize the link")
+        tk.Label(
             s_in,
-            orient="horizontal",
-            mode="determinate",
-            maximum=100,
-            style="Green.Horizontal.TProgressbar",
-        )
-        self.score_bar.pack(fill="x", pady=(10, 6))
-        self.score_detail = tk.StringVar(
-            value="Enable Max Ping 100% mode to stabilize your connection"
-        )
-        ttk.Label(s_in, textvariable=self.score_detail, style="CardMuted.TLabel").pack(anchor="w")
+            textvariable=self.score_detail,
+            bg=CARD,
+            fg=MUTED,
+            font=self.fonts["tiny"],
+            wraplength=180,
+            justify="center",
+        ).pack()
 
-        # Settings
-        card = ttk.Frame(outer, style="Card.TFrame")
-        card.pack(fill="x", pady=8)
-        inner = ttk.Frame(card, style="Card.TFrame")
-        inner.pack(fill="x", padx=14, pady=14)
-        ttk.Label(inner, text="SETTINGS", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+        tiles = tk.Frame(top, bg=BG)
+        tiles.pack(side="left", fill="both", expand=True)
+        tiles.columnconfigure(0, weight=1)
+        tiles.columnconfigure(1, weight=1)
+        tiles.rowconfigure(0, weight=1)
+        tiles.rowconfigure(1, weight=1)
+
+        self.tile_game = MetricTile(tiles, "Game", self.fonts)
+        self.tile_ping = MetricTile(tiles, "Ping", self.fonts)
+        self.tile_down = MetricTile(tiles, "Download", self.fonts)
+        self.tile_up = MetricTile(tiles, "Upload", self.fonts)
+        self.tile_game.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 6))
+        self.tile_ping.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 6))
+        self.tile_down.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(6, 0))
+        self.tile_up.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(6, 0))
+        self.tile_game.set("Not detected", "Launch HoN Reborn", "warn")
+        self.tile_ping.set("—", self.guard.settings.ping_host)
+        self.tile_down.set("—", "live")
+        self.tile_up.set("—", "live")
+
+        self.warn_wrap = tk.Frame(tab, bg="#2a1814", highlightbackground="#5a3028", highlightthickness=1)
+        self.warn_var = tk.StringVar(value="")
+        tk.Label(
+            self.warn_wrap,
+            textvariable=self.warn_var,
+            bg="#2a1814",
+            fg=ORANGE,
+            font=self.fonts["body_b"],
+            wraplength=860,
+            justify="left",
+            padx=12,
+            pady=8,
+        ).pack(fill="x")
+
+        settings = self._card(tab, fill="x", pady=(10, 0))
+        self._settings_card = settings
+        inner = tk.Frame(settings, bg=CARD)
+        inner.pack(fill="x", padx=16, pady=14)
+        tk.Label(inner, text="SETTINGS", bg=CARD, fg=GOLD, font=self.fonts["section"]).pack(
+            anchor="w", pady=(0, 10)
+        )
 
         self.link_var = tk.DoubleVar(value=self.guard.settings.link_mbps)
-        share = (
-            MAX_PING_SHARE if self.guard.settings.max_ping_mode else self.guard.settings.game_share
-        )
+        share = MAX_PING_SHARE if self.guard.settings.max_ping_mode else self.guard.settings.game_share
         self.share_var = tk.DoubleVar(value=share * 100)
         self.throttle_label = tk.StringVar()
         self.max_ping_var = tk.BooleanVar(value=self.guard.settings.max_ping_mode)
         self.do_var = tk.BooleanVar(value=self.guard.settings.tame_delivery_optimization)
         self.dscp_var = tk.BooleanVar(value=self.guard.settings.mark_dscp)
+        self.share_value = tk.StringVar(value=f"{int(self.share_var.get())}%")
+
+        grid = tk.Frame(inner, bg=CARD)
+        grid.pack(fill="x")
+        grid.columnconfigure(1, weight=1)
+
+        tk.Label(grid, text="Your download speed", bg=CARD, fg=TEXT, font=self.fonts["body"]).grid(
+            row=0, column=0, sticky="w", padx=(0, 12)
+        )
+        speed = tk.Frame(grid, bg=CARD)
+        speed.grid(row=0, column=1, sticky="e")
+        self.speed_entry = tk.Entry(
+            speed,
+            textvariable=self.link_var,
+            width=8,
+            justify="center",
+            bg=ENTRY,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            font=self.fonts["body_b"],
+            highlightthickness=1,
+            highlightbackground=EDGE,
+            highlightcolor=GOLD,
+        )
+        self.speed_entry.pack(side="left")
+        tk.Label(speed, text="  Mbps", bg=CARD, fg=MUTED, font=self.fonts["body"]).pack(side="left")
+
+        tk.Label(grid, text="Bandwidth cap share", bg=CARD, fg=TEXT, font=self.fonts["body"]).grid(
+            row=1, column=0, sticky="w", pady=(14, 0)
+        )
+        tk.Label(grid, textvariable=self.share_value, bg=CARD, fg=GOLD, font=self.fonts["body_b"]).grid(
+            row=1, column=1, sticky="e", pady=(14, 0)
+        )
+
+        self.slider = CapSlider(inner, self.share_var, command=self._on_share_move)
+        self.slider.pack(fill="x", pady=(8, 6))
+
+        tk.Label(
+            inner, textvariable=self.throttle_label, bg=CARD, fg=CYAN, font=self.fonts["stat"]
+        ).pack(anchor="w", pady=(2, 8))
+
+        self._make_check(
+            inner,
+            "Max ping mode  —  more headroom + system latency tweaks",
+            self.max_ping_var,
+            self._on_max_toggle,
+        )
+        if qos.is_windows():
+            self._make_check(
+                inner,
+                "Disable Windows Update Delivery Optimization",
+                self.do_var,
+                None,
+            )
+
+        self.link_var.trace_add("write", lambda *_: self._update_throttle_label())
         self._update_throttle_label()
 
-        row1 = ttk.Frame(inner, style="Card.TFrame")
-        row1.pack(fill="x", pady=4)
-        ttk.Label(row1, text="Your download speed (Mbps)", style="Card.TLabel").pack(side="left")
-        ttk.Entry(row1, textvariable=self.link_var, width=10, justify="center").pack(side="right")
-
-        row2 = ttk.Frame(inner, style="Card.TFrame")
-        row2.pack(fill="x", pady=(10, 4))
-        ttk.Label(row2, text="Bandwidth cap share %", style="Card.TLabel").pack(side="left")
-        self.share_value = tk.StringVar(value=f"{int(self.share_var.get())}%")
-        ttk.Label(row2, textvariable=self.share_value, style="Card.TLabel").pack(side="right")
-
-        ttk.Scale(
-            inner,
-            from_=25,
-            to=85,
-            orient="horizontal",
-            variable=self.share_var,
-            command=self._on_share_move,
-        ).pack(fill="x", pady=(2, 6))
-        self.link_var.trace_add("write", lambda *_: self._update_throttle_label())
-
-        ttk.Label(inner, textvariable=self.throttle_label, style="Stat.TLabel").pack(
-            anchor="w", pady=(4, 8)
+        log_head = tk.Frame(tab, bg=BG)
+        log_head.pack(fill="x", pady=(10, 4))
+        tk.Label(log_head, text="ACTIVITY", bg=BG, fg=MUTED, font=self.fonts["section"]).pack(
+            anchor="w"
         )
-        ttk.Checkbutton(
-            inner,
-            text="Max ping mode (more headroom + system latency tweaks)",
-            variable=self.max_ping_var,
-            command=self._on_max_toggle,
-        ).pack(anchor="w", pady=2)
-
-        if qos.is_windows():
-            ttk.Checkbutton(
-                inner,
-                text="Disable Windows Update Delivery Optimization",
-                variable=self.do_var,
-            ).pack(anchor="w", pady=2)
-
-        # Live stats
-        stats = ttk.Frame(outer, style="Card.TFrame")
-        stats.pack(fill="x", pady=8)
-        s_inner = ttk.Frame(stats, style="Card.TFrame")
-        s_inner.pack(fill="x", padx=14, pady=14)
-        ttk.Label(s_inner, text="LIVE STATUS", style="Section.TLabel").pack(
-            anchor="w", pady=(0, 8)
-        )
-
-        self.game_var = tk.StringVar(value="Game: not detected")
-        self.down_var = tk.StringVar(value="Download: —")
-        self.up_var = tk.StringVar(value="Upload: —")
-        self.ping_var = tk.StringVar(value="Ping: —")
-        self.warn_var = tk.StringVar(value="")
-
-        for var in (self.game_var, self.down_var, self.up_var, self.ping_var):
-            ttk.Label(s_inner, textvariable=var, style="Stat.TLabel").pack(anchor="w", pady=2)
-        ttk.Label(s_inner, textvariable=self.warn_var, style="Warn.TLabel").pack(
-            anchor="w", pady=(6, 0)
-        )
-
-        # Log
-        ttk.Label(outer, text="Log", style="Muted.TLabel").pack(anchor="w", pady=(8, 2))
-        log_wrap = tk.Frame(
-            outer, bg="#0b0e12", highlightbackground="#334152", highlightthickness=1
-        )
+        log_wrap = tk.Frame(tab, bg=ENTRY, highlightbackground=EDGE, highlightthickness=1)
         log_wrap.pack(fill="both", expand=True)
         self.log = tk.Text(
             log_wrap,
-            height=5,
-            bg="#0b0e12",
-            fg="#d5deea",
-            insertbackground="#d5deea",
-            font=self._mono(9),
+            height=6,
+            bg=ENTRY,
+            fg="#c5d0dc",
+            insertbackground=TEXT,
+            font=self.fonts["mono"],
             relief="flat",
             wrap="word",
-            padx=10,
-            pady=8,
+            padx=12,
+            pady=10,
             highlightthickness=0,
             borderwidth=0,
+            state="normal",
         )
         scroll = ttk.Scrollbar(log_wrap, command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
         self.log.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
 
-        self._append_log("Buttons stay fixed at the bottom. Use «Enable Max Ping 100%» with admin/root.")
-        if not qos.is_admin():
-            self._append_log("Warning: without root/Admin the bandwidth cap cannot be applied.")
+        # Unused StringVars kept so older snapshot code paths stay simple
+        self.game_var = tk.StringVar()
+        self.down_var = tk.StringVar()
+        self.up_var = tk.StringVar()
+        self.ping_var = tk.StringVar()
+
+    def _make_check(self, parent: tk.Misc, text: str, var: tk.BooleanVar, command) -> None:
+        tk.Checkbutton(
+            parent,
+            text=text,
+            variable=var,
+            command=command,
+            bg=CARD,
+            fg=TEXT,
+            activebackground=CARD,
+            activeforeground=TEXT,
+            selectcolor=GOLD,
+            highlightthickness=0,
+            bd=0,
+            relief="flat",
+            font=self.fonts["body"],
+            anchor="w",
+            padx=0,
+        ).pack(anchor="w", pady=2)
+
+    def _build_live(self, tab: tk.Frame) -> None:
+        card = self._card(tab, fill="both", expand=True)
+        wrap = tk.Frame(card, bg=CARD)
+        wrap.pack(fill="both", expand=True, padx=16, pady=14)
+
+        head = tk.Frame(wrap, bg=CARD)
+        head.pack(fill="x")
+        tk.Label(head, text="HON LIVE TRACKER", bg=CARD, fg=GOLD, font=self.fonts["section"]).pack(
+            side="left"
+        )
+        self.live_clock = tk.StringVar(value="--:--:--")
+        tk.Label(head, textvariable=self.live_clock, bg=CARD, fg=CYAN, font=self.fonts["stat"]).pack(
+            side="right"
+        )
+
+        self.live_status = tk.StringVar(value="Waiting for HoN / juvio.exe ...")
+        tk.Label(
+            wrap, textvariable=self.live_status, bg=CARD, fg=TEXT, font=self.fonts["body_b"]
+        ).pack(anchor="w", pady=(10, 4))
+
+        # Metric tiles row
+        metrics = tk.Frame(wrap, bg=CARD)
+        metrics.pack(fill="x", pady=(6, 10))
+        self.live_session = tk.StringVar(value="Session: 00:00")
+        self.live_cpu = tk.StringVar(value="CPU: —")
+        self.live_ram = tk.StringVar(value="RAM: —")
+        self.live_net = tk.StringVar(value="Sockets: —")
+        self.live_ping = tk.StringVar(value="Ping: —")
+        self.live_bw = tk.StringVar(value="Link: —")
+        for var in (
+            self.live_session,
+            self.live_cpu,
+            self.live_ram,
+            self.live_net,
+            self.live_ping,
+            self.live_bw,
+        ):
+            tk.Label(metrics, textvariable=var, bg=CARD, fg=MUTED, font=self.fonts["stat"]).pack(
+                anchor="w", pady=1
+            )
+
+        tk.Label(wrap, text="PROCESSES", bg=CARD, fg=GOLD, font=self.fonts["section"]).pack(
+            anchor="w", pady=(8, 4)
+        )
+        tree_frame = tk.Frame(wrap, bg=CARD)
+        tree_frame.pack(fill="both", expand=True)
+        cols = ("name", "pid", "cpu", "ram", "conns", "status")
+        self.live_tree = ttk.Treeview(
+            tree_frame, columns=cols, show="headings", selectmode="browse", height=8
+        )
+        for key, title, width in (
+            ("name", "Process", 140),
+            ("pid", "PID", 70),
+            ("cpu", "CPU %", 70),
+            ("ram", "RAM MB", 80),
+            ("conns", "Conns", 80),
+            ("status", "Status", 100),
+        ):
+            self.live_tree.heading(key, text=title)
+            self.live_tree.column(key, width=width, anchor="w")
+        live_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.live_tree.yview)
+        self.live_tree.configure(yscrollcommand=live_scroll.set)
+        self.live_tree.pack(side="left", fill="both", expand=True)
+        live_scroll.pack(side="right", fill="y")
+
+        tk.Label(wrap, text="REMOTE ENDPOINTS", bg=CARD, fg=GOLD, font=self.fonts["section"]).pack(
+            anchor="w", pady=(10, 4)
+        )
+        self.live_remotes = tk.StringVar(value="No remote connections yet")
+        tk.Label(
+            wrap,
+            textvariable=self.live_remotes,
+            bg=CARD,
+            fg=MUTED,
+            font=self.fonts["tiny"],
+            wraplength=820,
+            justify="left",
+        ).pack(anchor="w")
+
+        tk.Label(wrap, text="EVENT LOG", bg=CARD, fg=GOLD, font=self.fonts["section"]).pack(
+            anchor="w", pady=(10, 4)
+        )
+        self.live_events = tk.Text(
+            wrap,
+            height=5,
+            bg=ENTRY,
+            fg="#c5d0dc",
+            font=self.fonts["mono"],
+            relief="flat",
+            wrap="word",
+            padx=10,
+            pady=8,
+            highlightthickness=1,
+            highlightbackground=EDGE,
+        )
+        self.live_events.pack(fill="x")
+        self._live_was_running = False
+
+    def _build_hogs(self, tab: tk.Frame) -> None:
+        card = self._card(tab, fill="both", expand=True)
+        h_in = tk.Frame(card, bg=CARD)
+        h_in.pack(fill="both", expand=True, padx=16, pady=14)
+        tk.Label(h_in, text="WHO IS EATING YOUR INTERNET", bg=CARD, fg=GOLD, font=self.fonts["section"]).pack(
+            anchor="w"
+        )
+        tk.Label(
+            h_in,
+            text="Task Manager for the network — high-risk apps often cause HoN timeouts",
+            bg=CARD,
+            fg=MUTED,
+            font=self.fonts["tiny"],
+        ).pack(anchor="w", pady=(2, 8))
+        self.hogs_summary = tk.StringVar(value="Scanning network processes...")
+        tk.Label(h_in, textvariable=self.hogs_summary, bg=CARD, fg=CYAN, font=self.fonts["stat"]).pack(
+            anchor="w", pady=(0, 8)
+        )
+
+        tree_frame = tk.Frame(h_in, bg=CARD)
+        tree_frame.pack(fill="both", expand=True)
+        cols = ("process", "pid", "conns", "activity", "risk", "reason")
+        self.hog_tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="browse", height=14)
+        headings = {
+            "process": ("Process", 150),
+            "pid": ("PID", 70),
+            "conns": ("Connections", 100),
+            "activity": ("Activity", 100),
+            "risk": ("Risk", 80),
+            "reason": ("Why it hurts ping", 280),
+        }
+        for key, (title, width) in headings.items():
+            self.hog_tree.heading(key, text=title)
+            self.hog_tree.column(key, width=width, anchor="w")
+        self.hog_tree.tag_configure("high", foreground=ORANGE)
+        self.hog_tree.tag_configure("game", foreground=GREEN)
+        self.hog_tree.tag_configure("medium", foreground=GOLD)
+        self.hog_tree.tag_configure("low", foreground=MUTED)
+        tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.hog_tree.yview)
+        self.hog_tree.configure(yscrollcommand=tree_scroll.set)
+        self.hog_tree.pack(side="left", fill="both", expand=True)
+        tree_scroll.pack(side="right", fill="y")
+
+        hog_btns = tk.Frame(h_in, bg=CARD)
+        hog_btns.pack(fill="x", pady=(12, 0))
+        PillButton(hog_btns, "Refresh Scan", self._manual_hog_scan, font=self.fonts["btn"], width=140).pack(
+            side="left", padx=(0, 8)
+        )
+        PillButton(
+            hog_btns, "Kill Selected", self._kill_selected, font=self.fonts["btn"], variant="danger", width=140
+        ).pack(side="left", padx=(0, 8))
+        PillButton(
+            hog_btns, "Kill All High-Risk", self._kill_risky, font=self.fonts["btn"], variant="danger", width=168
+        ).pack(side="left")
+
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        self.btn_max.set_enabled(not busy)
+        self.btn_on.set_enabled(not busy)
+        if busy:
+            self.btn_max.set_text("Measuring...")
+            self.dock_hint.set("Measuring ping — please wait")
+        else:
+            self.btn_max.set_text("Max Ping 100%")
 
     def _on_share_move(self, _value: str) -> None:
         try:
@@ -401,7 +948,7 @@ class App(tk.Tk):
             return
         tmp = Settings(link_mbps=link, game_share=share, max_ping_mode=self.max_ping_var.get())
         self.throttle_label.set(
-            f"Expected cap: ~ {tmp.throttle_mbps():.1f} Mbps   |   Headroom ~ {link - tmp.throttle_mbps():.1f} Mbps"
+            f"Expected cap  ~ {tmp.throttle_mbps():.1f} Mbps     Headroom  ~ {link - tmp.throttle_mbps():.1f} Mbps"
         )
 
     def _read_settings_into_guard(self) -> None:
@@ -423,18 +970,34 @@ class App(tk.Tk):
         self._append_log("Settings saved.")
 
     def _run_activate(self, max_ping: bool) -> None:
+        if self._closing or self._busy:
+            return
         self._read_settings_into_guard()
         if max_ping:
             self.max_ping_var.set(True)
             self.share_var.set(MAX_PING_SHARE * 100)
             self.share_value.set(f"{int(MAX_PING_SHARE * 100)}%")
             self._read_settings_into_guard()
+        self._set_busy(True)
         self._append_log("Activating and measuring ping (a few seconds)...")
         self.update_idletasks()
-        ok = self.guard.activate(max_ping=max_ping)
+
+        def worker() -> None:
+            ok = self.guard.activate(max_ping=max_ping)
+            if self._closing:
+                return
+            self.after(0, lambda: self._finish_activate(ok))
+
+        threading.Thread(target=worker, name="hon-activate", daemon=True).start()
+
+    def _finish_activate(self, ok: bool) -> None:
+        if self._closing:
+            return
+        self._set_busy(False)
         for line in self.guard.status.history[-10:]:
             self._append_log(line)
         self._set_score(self.guard.status.live_score)
+        self._sync_mode_chip()
         if not ok and self.guard.status.last_error == "need admin":
             msg = (
                 "Run with: sudo ./run_linux.sh"
@@ -453,66 +1016,343 @@ class App(tk.Tk):
         self.guard.deactivate()
         self._append_log(self.guard.status.message)
         self._set_score(0)
+        self._sync_mode_chip()
+
+    def _sync_mode_chip(self) -> None:
+        st = self.guard.status
+        if st.active and st.max_ping_mode:
+            self.chip_mode.set("Max Ping", "gold")
+        elif st.active:
+            self.chip_mode.set("Active", "ok")
+        else:
+            self.chip_mode.set("Idle", "muted")
 
     def _set_score(self, value: float) -> None:
         value = max(0.0, min(100.0, value))
-        self.score_bar["value"] = value
-        self.score_var.set(f"Ping improvement: {value:.0f}%")
+        self._score_target = value
         if value >= 100:
-            self.score_detail.set("Fully stable — no saturation, steady ping, no timeouts")
+            self.score_detail.set("Fully stable — no saturation, steady ping")
         elif value >= 70:
-            self.score_detail.set("Strong improvement — keep the game open and watch the meter")
+            self.score_detail.set("Strong improvement — keep the game open")
         elif value > 0:
-            self.score_detail.set("Guard active — waiting for samples to stabilize")
+            self.score_detail.set("Guard active — waiting for samples")
         else:
             self.score_detail.set("Inactive")
+        if self._score_job is None and not self._closing:
+            self._tick_score()
+
+    def _tick_score(self) -> None:
+        if self._closing:
+            self._score_job = None
+            return
+        cur = self._score_shown
+        tgt = self._score_target
+        if abs(cur - tgt) < 0.4:
+            self._score_shown = tgt
+            self.ring.set(tgt, "STABLE" if tgt >= 100 else ("LIVE" if tgt > 0 else "IDLE"))
+            self._score_job = None
+            return
+        self._score_shown = cur + (tgt - cur) * 0.28
+        self.ring.set(self._score_shown, "STABLE" if tgt >= 100 else ("LIVE" if tgt > 0 else "IDLE"))
+        self._score_job = self.after(16, self._tick_score)
+
+    def _set_warn(self, text: str) -> None:
+        self.warn_var.set(text)
+        try:
+            mapped = bool(self.warn_wrap.winfo_ismapped())
+        except tk.TclError:
+            return
+        if text and not mapped:
+            self.warn_wrap.pack(fill="x", pady=(10, 0), before=self._settings_card)
+        elif not text and mapped:
+            self.warn_wrap.pack_forget()
 
     def _append_log(self, text: str) -> None:
         self.log.insert("end", text + "\n")
         self.log.see("end")
+        short = text if len(text) < 48 else text[:45] + "..."
+        self.dock_hint.set(short)
 
     def _on_snapshot(self, snap: Snapshot) -> None:
-        self.after(0, lambda: self._apply_snapshot(snap))
+        if self._closing:
+            return
+        try:
+            self.after(0, lambda s=snap: self._apply_snapshot(s))
+        except tk.TclError:
+            return
 
     def _apply_snapshot(self, snap: Snapshot) -> None:
-        if snap.game_found:
-            names = ", ".join(sorted({p.name for p in snap.processes}))
-            self.game_var.set(f"Game: running ({names})")
+        if self._closing:
+            return
+        try:
+            if snap.game_found:
+                names = ", ".join(sorted({p.name for p in snap.processes}))
+                self.tile_game.set("Running", names or "HoN Reborn", "good")
+                self.game_var.set(f"Game: running ({names})")
+            else:
+                self.tile_game.set("Not detected", "Launch HoN Reborn", "warn")
+                self.game_var.set("Game: not detected — launch HoN Reborn")
+
+            self.tile_down.set(format_rate(snap.total_down_bps), "live")
+            self.tile_up.set(format_rate(snap.total_up_bps), "live")
+            self.down_var.set(f"Download: {format_rate(snap.total_down_bps)}")
+            self.up_var.set(f"Upload: {format_rate(snap.total_up_bps)}")
+
+            host = self.guard.settings.ping_host
+            if snap.ping_ok and snap.ping_ms is not None:
+                tone = "good" if snap.ping_ms < 80 else ("warn" if snap.ping_ms < 140 else "bad")
+                self.tile_ping.set(f"{snap.ping_ms:.0f} ms", host, tone)
+                self.ping_var.set(f"Ping ({host}): {snap.ping_ms:.0f} ms")
+            elif snap.ping_ok:
+                self.tile_ping.set("OK", host, "good")
+                self.ping_var.set(f"Ping ({host}): OK")
+            else:
+                self.tile_ping.set("Timeout", host, "bad")
+                self.ping_var.set(f"Ping ({host}): timeout / failed")
+
+            if snap.saturating:
+                self._set_warn("Link saturated — lower share % or enable Max Ping mode")
+            elif not snap.ping_ok and snap.game_found:
+                self._set_warn("Timeout detected — enable Max Ping 100%")
+            else:
+                self._set_warn("")
+
+            score = self.guard.update_live_score(snap)
+            self._set_score(score)
+            self._update_hog_table(snap)
+            self._update_hon_live(snap)
+            self.guard.reapply_if_needed(snap)
+            self._sync_mode_chip()
+        except tk.TclError:
+            return
+
+    def _live_event(self, text: str) -> None:
+        line = f"[{time.strftime('%H:%M:%S')}] {text}\n"
+        try:
+            self.live_events.insert("end", line)
+            self.live_events.see("end")
+        except tk.TclError:
+            pass
+        self._append_log(text)
+
+    def _update_hon_live(self, snap: Snapshot) -> None:
+        hon = getattr(snap, "hon", None)
+        if hon is None:
+            return
+        self.live_clock.set(hon.clock or time.strftime("%H:%M:%S"))
+
+        if hon.just_opened:
+            self._live_event(
+                f"HoN OPENED — {hon.primary_name or 'game'} PID {hon.primary_pid} "
+                f"({hon.process_count} process(es))"
+            )
+            self._live_was_running = True
+        if hon.just_closed:
+            self._live_event("HoN CLOSED — session ended")
+            self._live_was_running = False
+
+        if hon.running:
+            self.live_status.set(
+                f"TRACKING  ·  {hon.primary_name or 'HoN'}  ·  PID {hon.primary_pid}  ·  "
+                f"{hon.process_count} process(es)"
+            )
+            self.live_session.set(f"Session: {format_duration(hon.session_seconds)}")
+            self.live_cpu.set(f"CPU: {hon.cpu_pct:.1f}%")
+            self.live_ram.set(f"RAM: {hon.ram_mb:.0f} MB")
+            self.live_net.set(f"Sockets: {hon.established} established / {hon.connections} total")
+            if snap.ping_ok and snap.ping_ms is not None:
+                self.live_ping.set(f"Ping: {snap.ping_ms:.0f} ms")
+            elif snap.ping_ok:
+                self.live_ping.set("Ping: OK")
+            else:
+                self.live_ping.set("Ping: TIMEOUT")
+            self.live_bw.set(
+                f"Link: ↓ {format_rate(snap.total_down_bps)}   ↑ {format_rate(snap.total_up_bps)}"
+            )
+            if hon.remotes:
+                self.live_remotes.set("  ·  ".join(hon.remotes))
+            else:
+                self.live_remotes.set("Connected locally / no remote endpoints yet")
         else:
-            self.game_var.set("Game: not detected — launch HoN Reborn")
+            self.live_status.set("Waiting for HoN / juvio.exe ...")
+            self.live_session.set("Session: 00:00")
+            self.live_cpu.set("CPU: —")
+            self.live_ram.set("RAM: —")
+            self.live_net.set("Sockets: —")
+            self.live_ping.set("Ping: —")
+            self.live_bw.set("Link: —")
+            self.live_remotes.set("No remote connections yet")
 
-        self.down_var.set(f"Download: {format_rate(snap.total_down_bps)}")
-        self.up_var.set(f"Upload: {format_rate(snap.total_up_bps)}")
+        self.live_tree.delete(*self.live_tree.get_children())
+        for p in hon.processes:
+            self.live_tree.insert(
+                "",
+                "end",
+                values=(
+                    p.name,
+                    p.pid,
+                    f"{p.cpu_pct:.1f}",
+                    f"{p.ram_mb:.0f}",
+                    f"{p.established}/{p.connections}",
+                    p.status,
+                ),
+            )
 
-        if snap.ping_ok and snap.ping_ms is not None:
-            self.ping_var.set(f"Ping ({self.guard.settings.ping_host}): {snap.ping_ms:.0f} ms")
-        elif snap.ping_ok:
-            self.ping_var.set(f"Ping ({self.guard.settings.ping_host}): OK")
-        else:
-            self.ping_var.set(f"Ping ({self.guard.settings.ping_host}): timeout / failed")
+    def _update_hog_table(self, snap: Snapshot) -> None:
+        hogs = getattr(snap, "hogs", []) or []
+        high = sum(1 for h in hogs if getattr(h, "risk", "") == "high")
+        self.hogs_summary.set(
+            f"Tracked sockets: {snap.hog_connections}   ·   Listed: {len(hogs)}   ·   High-risk: {high}"
+        )
 
-        if snap.saturating:
-            self.warn_var.set("Link saturated — lower share % or enable Max Ping mode")
-        elif not snap.ping_ok and snap.game_found:
-            self.warn_var.set("Timeout detected — enable Max Ping 100%")
-        else:
-            self.warn_var.set("")
+        selected_pid = None
+        sel = self.hog_tree.selection()
+        if sel:
+            selected_pid = self._hog_rows.get(sel[0])
 
-        score = self.guard.update_live_score(snap)
-        self._set_score(score)
-        self.guard.reapply_if_needed(snap)
+        self.hog_tree.delete(*self.hog_tree.get_children())
+        self._hog_rows.clear()
+        reselect = None
+        for hog in hogs:
+            iid = self.hog_tree.insert(
+                "",
+                "end",
+                values=(
+                    hog.name,
+                    hog.pid,
+                    f"{hog.established}/{hog.connections}",
+                    format_activity(hog.activity),
+                    hog.risk.upper(),
+                    hog.reason,
+                ),
+                tags=(hog.risk,),
+            )
+            self._hog_rows[iid] = hog.pid
+            if selected_pid == hog.pid:
+                reselect = iid
+        if reselect:
+            self.hog_tree.selection_set(reselect)
+
+        if snap.saturating and high:
+            top = next((h for h in hogs if h.risk == "high"), None)
+            msg = (
+                f"Saturation + high-risk app: {top.name} (PID {top.pid}) — kill it to stop timeouts"
+                if top
+                else "Link saturated — open Network Task Manager and kill high-risk apps"
+            )
+            if msg != self._last_hog_warn:
+                self._last_hog_warn = msg
+                self._set_warn(msg)
+                self._append_log(msg)
+
+    def _manual_hog_scan(self) -> None:
+        if self._closing:
+            return
+        try:
+            scan = self.guard.monitor._hog_scanner.scan(top_n=12)
+            self.guard.monitor._last_hogs = scan.hogs
+            self.guard.monitor._last_hog_conns = scan.total_connections
+            fake = Snapshot(
+                timestamp=scan.timestamp,
+                game_found=False,
+                hogs=scan.hogs,
+                hog_connections=scan.total_connections,
+            )
+            self._update_hog_table(fake)
+            self._append_log(f"Manual scan: {len(scan.hogs)} network processes listed.")
+        except Exception as exc:
+            self._append_log(f"Scan failed: {exc}")
+
+    def _kill_selected(self) -> None:
+        sel = self.hog_tree.selection()
+        if not sel:
+            messagebox.showinfo("Kill Selected", "Select a process in the list first.")
+            return
+        pid = self._hog_rows.get(sel[0])
+        if not pid:
+            return
+        if not messagebox.askyesno("Confirm", f"Kill PID {pid}?"):
+            return
+        ok, msg = kill_process(pid)
+        self._append_log(msg)
+        if ok:
+            self._manual_hog_scan()
+
+    def _kill_risky(self) -> None:
+        hogs = list(getattr(self.guard.monitor, "_last_hogs", []) or [])
+        if not hogs:
+            self._manual_hog_scan()
+            hogs = list(getattr(self.guard.monitor, "_last_hogs", []) or [])
+        risky = [h for h in hogs if h.risk == "high" and h.can_kill]
+        if not risky:
+            messagebox.showinfo("Kill Risky", "No high-risk bandwidth hogs found right now.")
+            return
+        names = ", ".join(f"{h.name}({h.pid})" for h in risky[:8])
+        if not messagebox.askyesno(
+            "Confirm",
+            f"Kill these high-risk apps?\n\n{names}\n\n(Game process will NOT be killed)",
+        ):
+            return
+        for msg in kill_high_risk(risky):
+            self._append_log(msg)
+        self._manual_hog_scan()
 
     def _refresh_status_bar(self) -> None:
-        self.admin_var.set(self._priv_text())
-        self.after(2000, self._refresh_status_bar)
+        if self._closing:
+            return
+        try:
+            t, tone = self._priv_text()
+            self.chip_priv.set(t, tone)
+            self._sync_mode_chip()
+            self._status_job = self.after(2000, self._refresh_status_bar)
+        except tk.TclError:
+            self._status_job = None
 
     def _on_close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
         try:
-            self.guard.stop_monitor()
-        finally:
+            if self._status_job is not None:
+                try:
+                    self.after_cancel(self._status_job)
+                except (tk.TclError, ValueError):
+                    pass
+                self._status_job = None
+            if self._score_job is not None:
+                try:
+                    self.after_cancel(self._score_job)
+                except (tk.TclError, ValueError):
+                    pass
+                self._score_job = None
+            try:
+                self._append_log("Shutting down...")
+                self.update_idletasks()
+            except tk.TclError:
+                pass
+            self.guard.shutdown(remove_qos=True)
+        except Exception:
+            try:
+                self.guard.shutdown(remove_qos=True)
+            except Exception:
+                pass
+        try:
+            self.quit()
+        except tk.TclError:
+            pass
+        try:
             self.destroy()
+        except tk.TclError:
+            pass
 
 
 def run_gui() -> None:
     app = App()
-    app.mainloop()
+    try:
+        app.mainloop()
+    finally:
+        if not getattr(app, "_closing", False):
+            try:
+                app.guard.shutdown(remove_qos=True)
+            except Exception:
+                pass
