@@ -1,6 +1,28 @@
-# HoN Net Guard
+# HoN Net Guard / ZYTONA APP
 
 Python tool that stabilizes your network while playing **Heroes of Newerth Reborn** on **Windows** and **Linux**.
+
+## Publish Windows .exe (ZYTONA APP)
+
+Build **must be done on a Windows PC** (PyInstaller cannot produce a real Windows EXE from Linux).
+
+1. Copy this project folder to Windows
+2. Install [Python 3.10+](https://www.python.org/downloads/) and tick **Add to PATH**
+3. Double-click **`build_windows.bat`**
+4. Wait until it finishes — output file:
+
+```text
+dist\ZYTONA_APP.exe
+```
+
+5. Run `ZYTONA_APP.exe` (UAC Admin prompt appears automatically)
+
+Or use `run_zytona_exe.bat` after building.
+
+### What the build does
+- Installs `psutil` + `pyinstaller`
+- Packs the GUI into a single `.exe`
+- Requests Administrator rights (needed for Windows QoS)
 
 ## Problem
 
@@ -9,7 +31,7 @@ Internet works fine until you open the game:
 - bandwidth saturation
 - high ping
 
-## Windows
+## Windows (Python source)
 
 1. Install Python 3.10+ with Add to PATH
 2. Right-click `run_as_admin.bat` → **Run as administrator**
@@ -40,24 +62,14 @@ sudo ./run_linux.sh
 
 3. Enter your speed → **Enable** → launch the game (Wine / Lutris / native)
 
-Uses **tc + IFB + CAKE/HTB** on the default interface (caps download/upload and reduces bufferbloat).
-
-Manual stop:
-
-```bash
-sudo tc qdisc del dev $(ip route show default | awk '/default/ {print $5; exit}') ingress
-sudo tc qdisc del dev $(ip route show default | awk '/default/ {print $5; exit}') root
-sudo ip link delete ifb-hon 2>/dev/null || true
-```
+Uses **tc + IFB + CAKE/HTB** on the default interface.
 
 ## Max Ping 100% mode
 
-The **Enable Max Ping 100%** button:
 - Leaves more headroom (~38% of link used as cap)
 - Measures ping before/after
-- Linux: CAKE `diffserv4` + `ack-filter` + sysctl/BBR tweaks
-- Windows: disable Nagle + Games profile + Delivery Optimization off
-- Live ping-improvement meter (reaches 100% when stable: no saturation, no timeouts)
+- Linux: CAKE + sysctl/BBR tweaks
+- Windows: Nagle off + Games profile + Delivery Optimization off
 
 ## Suggested settings
 
@@ -73,10 +85,5 @@ If timeouts remain: lower share to **40–45%**.
 
 ```bash
 pip install -r requirements.txt
-# Windows (Admin) or Linux (root):
 python main.py
 ```
-
-## Linux note
-
-On Linux the cap applies to the **whole interface** (not only the game process). That is intentional to stop link saturation while playing. Stop the guard after gaming to restore full speed.

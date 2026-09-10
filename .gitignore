@@ -1,0 +1,10 @@
+build/
+dist/
+*.spec.bak
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.hon_net_guard.json
+.hon_net_guard_linux_state.json

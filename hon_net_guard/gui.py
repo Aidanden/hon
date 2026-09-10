@@ -12,8 +12,9 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from .config import MAX_PING_SHARE, Settings
+from .hon_tracker import format_activity as hon_format_activity
+from .hon_tracker import format_duration, fix_hon_net_hogs, stop_hon_service
 from .hogs import format_activity, kill_high_risk, kill_process
-from .hon_tracker import format_duration
 from .monitor import Snapshot, format_rate
 from .stabilizer import HonNetGuard
 from . import qos
@@ -352,8 +353,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"ZYTONA APP — HoN Net Guard — {qos.platform_name()}")
-        self.geometry("960x720")
-        self.minsize(880, 640)
+        # Size is fitted to content after UI build (see _fit_to_content).
+        self.minsize(640, 480)
         self.configure(bg=BG)
         try:
             self.tk.call("tk", "scaling", 1.1)
@@ -564,6 +565,30 @@ class App(tk.Tk):
         self._append_log("HoN Live tracks the game moment-by-moment when it opens.")
         if not qos.is_admin():
             self._append_log("Warning: without root/Admin the bandwidth cap cannot be applied.")
+
+        # Default window size = content size (not a fixed oversized box).
+        self.after_idle(self._fit_to_content)
+
+    def _fit_to_content(self) -> None:
+        """Resize the window to wrap the built UI, centered on screen."""
+        try:
+            self.update_idletasks()
+            req_w = int(self.winfo_reqwidth())
+            req_h = int(self.winfo_reqheight())
+            # Small padding so nothing clips at the edges
+            w = req_w + 16
+            h = req_h + 16
+            sw = int(self.winfo_screenwidth())
+            sh = int(self.winfo_screenheight())
+            # Never exceed the screen; keep a usable minimum
+            w = max(680, min(w, sw - 40))
+            h = max(520, min(h, sh - 60))
+            x = max(0, (sw - w) // 2)
+            y = max(0, (sh - h) // 3)
+            self.geometry(f"{w}x{h}+{x}+{y}")
+            self.minsize(min(680, w), min(520, h))
+        except tk.TclError:
+            pass
 
     def _show_page(self, name: str) -> None:
         self._page = name
@@ -779,55 +804,99 @@ class App(tk.Tk):
             side="right"
         )
 
+        # Big ping panel
+        ping_box = tk.Frame(wrap, bg=CARD_HI, highlightbackground=EDGE, highlightthickness=1)
+        ping_box.pack(fill="x", pady=(12, 8))
+        ping_in = tk.Frame(ping_box, bg=CARD_HI)
+        ping_in.pack(fill="x", padx=14, pady=12)
+        tk.Label(ping_in, text="LIVE PING", bg=CARD_HI, fg=GOLD, font=self.fonts["section"]).pack(
+            anchor="w"
+        )
+        self.live_ping_big = tk.StringVar(value="— ms")
+        self.live_ping_label = tk.Label(
+            ping_in, textvariable=self.live_ping_big, bg=CARD_HI, fg=GREEN, font=self.fonts["score"]
+        )
+        self.live_ping_label.pack(anchor="w", pady=(4, 0))
+        self.live_ping_detail = tk.StringVar(value="Waiting for samples...")
+        tk.Label(
+            ping_in, textvariable=self.live_ping_detail, bg=CARD_HI, fg=MUTED, font=self.fonts["tiny"]
+        ).pack(anchor="w", pady=(2, 0))
+        self.live_ping_hist = tk.StringVar(value="History: —")
+        tk.Label(
+            ping_in, textvariable=self.live_ping_hist, bg=CARD_HI, fg=MUTED, font=self.fonts["mono"]
+        ).pack(anchor="w", pady=(4, 0))
+
         self.live_status = tk.StringVar(value="Waiting for HoN / juvio.exe ...")
         tk.Label(
             wrap, textvariable=self.live_status, bg=CARD, fg=TEXT, font=self.fonts["body_b"]
-        ).pack(anchor="w", pady=(10, 4))
+        ).pack(anchor="w", pady=(6, 4))
 
-        # Metric tiles row
         metrics = tk.Frame(wrap, bg=CARD)
-        metrics.pack(fill="x", pady=(6, 10))
+        metrics.pack(fill="x", pady=(2, 8))
         self.live_session = tk.StringVar(value="Session: 00:00")
         self.live_cpu = tk.StringVar(value="CPU: —")
         self.live_ram = tk.StringVar(value="RAM: —")
         self.live_net = tk.StringVar(value="Sockets: —")
-        self.live_ping = tk.StringVar(value="Ping: —")
         self.live_bw = tk.StringVar(value="Link: —")
+        self.live_hogs = tk.StringVar(value="HoN net hogs: 0")
         for var in (
             self.live_session,
             self.live_cpu,
             self.live_ram,
             self.live_net,
-            self.live_ping,
             self.live_bw,
+            self.live_hogs,
         ):
             tk.Label(metrics, textvariable=var, bg=CARD, fg=MUTED, font=self.fonts["stat"]).pack(
                 anchor="w", pady=1
             )
 
-        tk.Label(wrap, text="PROCESSES", bg=CARD, fg=GOLD, font=self.fonts["section"]).pack(
-            anchor="w", pady=(8, 4)
-        )
+        # Action buttons for HoN services
+        acts = tk.Frame(wrap, bg=CARD)
+        acts.pack(fill="x", pady=(4, 8))
+        PillButton(
+            acts, "Fix HoN Net", self._fix_hon_net, font=self.fonts["btn"], variant="primary", width=140
+        ).pack(side="left", padx=(0, 8))
+        PillButton(
+            acts, "Stop Selected", self._stop_hon_selected, font=self.fonts["btn"], variant="danger", width=140
+        ).pack(side="left", padx=(0, 8))
+        PillButton(
+            acts, "Stop All Hogs", self._stop_hon_hogs, font=self.fonts["btn"], variant="danger", width=140
+        ).pack(side="left")
+
+        tk.Label(
+            wrap,
+            text="HoN SERVICES / PROCESSES  (red = net hog — can stop)",
+            bg=CARD,
+            fg=GOLD,
+            font=self.fonts["section"],
+        ).pack(anchor="w", pady=(8, 4))
         tree_frame = tk.Frame(wrap, bg=CARD)
         tree_frame.pack(fill="both", expand=True)
-        cols = ("name", "pid", "cpu", "ram", "conns", "status")
+        cols = ("name", "pid", "role", "activity", "conns", "hog", "reason")
         self.live_tree = ttk.Treeview(
-            tree_frame, columns=cols, show="headings", selectmode="browse", height=8
+            tree_frame, columns=cols, show="headings", selectmode="browse", height=7
         )
         for key, title, width in (
-            ("name", "Process", 140),
-            ("pid", "PID", 70),
-            ("cpu", "CPU %", 70),
-            ("ram", "RAM MB", 80),
-            ("conns", "Conns", 80),
-            ("status", "Status", 100),
+            ("name", "Process", 130),
+            ("pid", "PID", 60),
+            ("role", "Role", 90),
+            ("activity", "Net Activity", 100),
+            ("conns", "Conns", 70),
+            ("hog", "Hog?", 60),
+            ("reason", "Notes", 260),
         ):
             self.live_tree.heading(key, text=title)
             self.live_tree.column(key, width=width, anchor="w")
+        self.live_tree.tag_configure("hog", foreground=ORANGE)
+        self.live_tree.tag_configure("core", foreground=GREEN)
+        self.live_tree.tag_configure("service", foreground=RED)
+        self.live_tree.tag_configure("ok", foreground=MUTED)
         live_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.live_tree.yview)
         self.live_tree.configure(yscrollcommand=live_scroll.set)
         self.live_tree.pack(side="left", fill="both", expand=True)
         live_scroll.pack(side="right", fill="y")
+        self._live_rows: dict[str, int] = {}
 
         tk.Label(wrap, text="REMOTE ENDPOINTS", bg=CARD, fg=GOLD, font=self.fonts["section"]).pack(
             anchor="w", pady=(10, 4)
@@ -848,7 +917,7 @@ class App(tk.Tk):
         )
         self.live_events = tk.Text(
             wrap,
-            height=5,
+            height=4,
             bg=ENTRY,
             fg="#c5d0dc",
             font=self.fonts["mono"],
@@ -861,6 +930,7 @@ class App(tk.Tk):
         )
         self.live_events.pack(fill="x")
         self._live_was_running = False
+        self._last_hon_state = None
 
     def _build_hogs(self, tab: tk.Frame) -> None:
         card = self._card(tab, fill="both", expand=True)
@@ -1139,7 +1209,41 @@ class App(tk.Tk):
         hon = getattr(snap, "hon", None)
         if hon is None:
             return
+        self._last_hon_state = hon
         self.live_clock.set(hon.clock or time.strftime("%H:%M:%S"))
+
+        # Big ping display
+        if snap.ping_ok and snap.ping_ms is not None:
+            self.live_ping_big.set(f"{snap.ping_ms:.0f} ms")
+            if snap.ping_ms < 70:
+                color = GREEN
+                tone = "Excellent"
+            elif snap.ping_ms < 120:
+                color = GOLD
+                tone = "Playable"
+            else:
+                color = ORANGE
+                tone = "High — check HoN net hogs"
+            self.live_ping_label.configure(fg=color)
+            self.live_ping_detail.set(
+                f"{tone}  ·  target {self.guard.settings.ping_host}  ·  live while HoN runs"
+            )
+        elif snap.ping_ok:
+            self.live_ping_big.set("OK")
+            self.live_ping_label.configure(fg=GREEN)
+            self.live_ping_detail.set("Reply OK (no timing)")
+        else:
+            self.live_ping_big.set("TIMEOUT")
+            self.live_ping_label.configure(fg=RED)
+            self.live_ping_detail.set("Ping failed — enable Max Ping / Fix HoN Net")
+
+        hist = hon.ping_history or []
+        if hist:
+            self.live_ping_hist.set(
+                "History: " + " → ".join(f"{v:.0f}" for v in hist[-12:]) + " ms"
+            )
+        else:
+            self.live_ping_hist.set("History: collecting...")
 
         if hon.just_opened:
             self._live_event(
@@ -1160,15 +1264,16 @@ class App(tk.Tk):
             self.live_cpu.set(f"CPU: {hon.cpu_pct:.1f}%")
             self.live_ram.set(f"RAM: {hon.ram_mb:.0f} MB")
             self.live_net.set(f"Sockets: {hon.established} established / {hon.connections} total")
-            if snap.ping_ok and snap.ping_ms is not None:
-                self.live_ping.set(f"Ping: {snap.ping_ms:.0f} ms")
-            elif snap.ping_ok:
-                self.live_ping.set("Ping: OK")
-            else:
-                self.live_ping.set("Ping: TIMEOUT")
             self.live_bw.set(
                 f"Link: ↓ {format_rate(snap.total_down_bps)}   ↑ {format_rate(snap.total_up_bps)}"
             )
+            self.live_hogs.set(
+                f"HoN net hogs: {hon.hog_count}  ·  stoppable: {len(hon.stoppable)}"
+            )
+            if hon.hog_count and snap.saturating:
+                self._set_warn(
+                    f"HoN service hogging net — use Fix HoN Net ({hon.hog_count} flagged)"
+                )
             if hon.remotes:
                 self.live_remotes.set("  ·  ".join(hon.remotes))
             else:
@@ -1179,24 +1284,87 @@ class App(tk.Tk):
             self.live_cpu.set("CPU: —")
             self.live_ram.set("RAM: —")
             self.live_net.set("Sockets: —")
-            self.live_ping.set("Ping: —")
             self.live_bw.set("Link: —")
+            self.live_hogs.set("HoN net hogs: 0")
             self.live_remotes.set("No remote connections yet")
 
+        selected_pid = None
+        sel = self.live_tree.selection()
+        if sel:
+            selected_pid = self._live_rows.get(sel[0])
+
         self.live_tree.delete(*self.live_tree.get_children())
+        self._live_rows.clear()
+        reselect = None
         for p in hon.processes:
-            self.live_tree.insert(
+            tag = "core" if p.role == "core" else ("hog" if p.net_hog else ("service" if p.role == "service" else "ok"))
+            iid = self.live_tree.insert(
                 "",
                 "end",
                 values=(
                     p.name,
                     p.pid,
-                    f"{p.cpu_pct:.1f}",
-                    f"{p.ram_mb:.0f}",
+                    p.role.upper(),
+                    hon_format_activity(p.activity_bps),
                     f"{p.established}/{p.connections}",
-                    p.status,
+                    "YES" if p.net_hog else "no",
+                    p.reason,
                 ),
+                tags=(tag,),
             )
+            self._live_rows[iid] = p.pid
+            if selected_pid == p.pid:
+                reselect = iid
+        if reselect:
+            self.live_tree.selection_set(reselect)
+
+    def _stop_hon_selected(self) -> None:
+        sel = self.live_tree.selection()
+        if not sel:
+            messagebox.showinfo("Stop Selected", "Select a HoN service/process first.")
+            return
+        pid = self._live_rows.get(sel[0])
+        if not pid:
+            return
+        if not messagebox.askyesno("Confirm", f"Stop HoN-related PID {pid}?\n(Core game is protected)"):
+            return
+        ok, msg = stop_hon_service(pid)
+        self._live_event(msg)
+        if not ok:
+            messagebox.showwarning("Stop", msg)
+
+    def _stop_hon_hogs(self) -> None:
+        state = self._last_hon_state
+        if state is None or not state.stoppable:
+            messagebox.showinfo("Stop All Hogs", "No stoppable HoN net hogs right now.")
+            return
+        names = ", ".join(f"{p.name}({p.pid})" for p in state.stoppable[:8])
+        if not messagebox.askyesno("Confirm", f"Stop these HoN net hogs?\n\n{names}"):
+            return
+        for msg in fix_hon_net_hogs(state):
+            self._live_event(msg)
+
+    def _fix_hon_net(self) -> None:
+        """Stop HoN net-hog services + re-apply bandwidth guard."""
+        self._live_event("Fix HoN Net: scanning & stopping hogs...")
+        state = self._last_hon_state
+        if state is not None:
+            for msg in fix_hon_net_hogs(state):
+                self._live_event(msg)
+        # Re-apply shaping without full ping round if already active, else activate max
+        if self.guard.status.active:
+            result = qos.apply_throttle(self.guard.settings)
+            if result.ok:
+                self._live_event("Bandwidth cap re-applied.")
+            else:
+                self._live_event(f"Cap re-apply failed: {result.stderr or result.stdout}")
+        else:
+            self._live_event("Guard was off — enabling Max Ping mode...")
+            self._activate_max()
+        flush = qos.flush_dns()
+        if flush.ok and flush.stdout != "skip":
+            self._live_event("DNS flushed.")
+        self._live_event("Fix HoN Net done.")
 
     def _update_hog_table(self, snap: Snapshot) -> None:
         hogs = getattr(snap, "hogs", []) or []

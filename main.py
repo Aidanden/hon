@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
-"""Entry point for HoN Net Guard."""
+"""Entry point for ZYTONA APP / HoN Net Guard."""
 
 from __future__ import annotations
 
+import os
 import signal
 import sys
 
 
+def _prepare_frozen_env() -> None:
+    """Ensure imports work when running from a PyInstaller .exe."""
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+        if base and base not in sys.path:
+            sys.path.insert(0, base)
+        os.environ.setdefault("ZYTONA_APP_DIR", os.path.dirname(sys.executable))
+
+
 def main() -> int:
+    _prepare_frozen_env()
     from hon_net_guard.gui import App
 
     app = App()
@@ -15,7 +26,6 @@ def main() -> int:
 
     def request_close(*_args) -> None:
         try:
-            # Schedule on Tk thread; also force quit if already closing.
             if getattr(app, "_closing", False):
                 try:
                     app.quit()
@@ -39,7 +49,6 @@ def main() -> int:
         except Exception:
             pass
 
-    # Keep Tk responsive to Ctrl+C by pumping a no-op timer.
     def _heartbeat() -> None:
         if getattr(app, "_closing", False):
             return
@@ -59,7 +68,6 @@ def main() -> int:
             if not getattr(app, "_closing", False):
                 app.guard.shutdown(remove_qos=True)
             elif getattr(app, "guard", None) is not None:
-                # Ensure monitor is stopped even if close raced.
                 app.guard.stop_monitor()
         except Exception:
             pass

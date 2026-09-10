@@ -222,12 +222,6 @@ class NetMonitor:
 
         # Live HoN tracker — every tick
         hon_state = self._hon_tracker.sample()
-        game_found = hon_state.running or bool(procs)
-        game_down = total_down if game_found else 0.0
-        game_up = total_up if game_found else 0.0
-
-        link_bps = max(self.settings.link_mbps * 1_000_000 / 8.0, 1.0)
-        saturating = total_down >= link_bps * 0.85 or total_up >= link_bps * 0.85
 
         # When HoN is open: ping every tick for moment-by-moment latency.
         self._tick += 1
@@ -236,6 +230,18 @@ class NetMonitor:
             ok, ms = ping_once(self.settings.ping_host, timeout_sec=0.7, stop_event=self._stop)
             self._last_ping_ok = ok
             self._last_ping_ms = ms
+            self._hon_tracker.note_ping(ok, ms)
+
+        hon_state.ping_ok = self._last_ping_ok
+        hon_state.ping_ms = self._last_ping_ms
+        hon_state.ping_history = self._hon_tracker.ping_history()
+
+        game_found = hon_state.running or bool(procs)
+        game_down = total_down if game_found else 0.0
+        game_up = total_up if game_found else 0.0
+
+        link_bps = max(self.settings.link_mbps * 1_000_000 / 8.0, 1.0)
+        saturating = total_down >= link_bps * 0.85 or total_up >= link_bps * 0.85
 
         # Network Task Manager scan less often while gaming (keep loop snappy).
         hog_every = 4 if hon_state.running else 3
